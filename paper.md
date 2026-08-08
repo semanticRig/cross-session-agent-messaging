@@ -1,97 +1,83 @@
-# Living Without Daemons: Cross-Session Messaging for AI Coding Agents
+# Claude Code Got Agent Teams. So Did We.
 
-A maildir spool and plugin hooks. No sockets, no servers, no model cooperation required.
+July 2026. Claude Code ships agent teams. You open two terminals, two independent sessions, and they can message each other. The lead watches teammates in real time. If one veers off track, you send a correction mid-task. No restart, no context drop.
 
----
+OpenCode had nothing like this. Subagents are fire-and-forget. You dispatch them, they run, they report. You cannot correct one mid-flight. The orchestrator is blocked inside `task()` until completion.
 
-## The Problem
+Then we found the hook.
 
-Claude Code added something useful in mid-2026: agent teams. You can open two terminal windows, start two independent Claude Code sessions, and they can message each other. The lead agent can see what its teammates are doing in real time. If one goes off track, you send a correction mid-task. No restarting, no context loss.
+## The hook
 
-OpenCode, the agent framework we run, has no such thing. You can dispatch subagents inside a session, sure. The orchestrator spawns workers, waits for results, synthesizes. But those subagents are fire and forget. They run, they finish, they report back. You cannot correct one mid-flight. You cannot send a message from one terminal session to another. The only communication channel is the orchestrator, and the orchestrator is blocked inside `task()` until the subagent is done.
+OpenCode subagents are not separate processes. They are conversations inside the parent session. Every subagent row in the SQLite `session` table has a `parent_id` and shares the parent's process tree.
 
-We wanted this feature. Here is how we built it.
+Because they share the process, they also share the parent's plugin hooks.
 
-## What We Found
+`tool.execute.after` fires after every tool call in every session. Subagents included. It receives the session ID, the tool name, and the output text. And it can mutate that text before the language model sees it.
 
-The subagent model in OpenCode is not what most people assume. Subagents are not separate processes. They are conversations inside the parent session's process tree. When you call `task(subagent_type="qa", prompt="review this")`, OpenCode does not fork. It creates a new row in its SQLite `session` table, stamps a `parent_id`, and runs the conversation in the same node process.
+This was not documented. The hook payload shape is not versioned. But it works. Deterministically. Every tool call, every subagent, every time.
 
-This turned out to be the key. Because subagents share the parent's process, they also share the parent's plugin hooks.
+A probe plugin confirmed it. The injected text landed in the subagent's durable transcript. The model read it on the next turn. No API call, no bash tool that the model might skip, no cooperation required. The mechanism was hiding in plain sight.
 
-OpenCode has a plugin system. Plugins register callbacks that fire at specific moments: when a tool executes, when the system prompt is built, when a shell command runs. The one that matters is `tool.execute.after`. It fires after every tool call in every session, subagents included. It receives the session ID, the tool name, and the output text. And it can mutate that output before the language model sees it.
+## The bus
 
-This means you can splice a message into a running subagent's context. Deterministically. No API call, no bash tool that the model might skip, no cooperation from the LLM. The hook fires, the text is appended, the model reads it on its next turn.
+The hook is the injection point. We needed a transport.
 
-The assumption that blocked earlier attempts, recorded in our architecture decision log as "mid-turn injection is not available in OpenCode," was wrong. The mechanism was there the whole time.
+Unix domain sockets need a process in an event loop. A subagent is a conversation, not a process. There is nothing to connect to. A broker daemon would need its own lifecycle and crash recovery. Named pipes have blocking semantics and no persistence.
 
-## The Architecture
-
-We needed a transport. Something to carry messages from a CTO session to a subagent's inbox, where the plugin hook would find them and inject them.
-
-The obvious choices were wrong. Unix domain sockets require a process in an event loop. A subagent is a conversation, not a process. There is nothing to connect to. A broker daemon would need its own lifecycle, crash recovery, authentication. Named pipes have blocking semantics and no persistence.
-
-We used a maildir.
-
-A maildir is a directory layout invented for email servers in the 1990s. It has three subdirectories: `tmp`, `new`, and `cur`. You write a message to a temp file in `tmp`, sync it, and atomically rename it into `new`. The reader atomically renames it from `new` to `cur` when delivering. No locks, no partial reads, crash-safe by construction. Forty years of Qmail and Postfix have proven this pattern.
-
-Our bus layout:
+We used a maildir. Three directories: `tmp`, `new`, `cur`. Write to `tmp`, sync, atomic rename into `new`. Reader atomically renames to `cur` when delivering. No locks, no partial reads, crash-safe since the 1990s.
 
 ```
 ~/.agent-memory/sessions/bus/
   qa-agent/
-    tmp/       messages being written
+    tmp/       being written
     new/       pending delivery
-    cur/       delivered, waiting for acknowledgement
+    cur/       delivered, waiting for ack
     directives.json   sticky corrections
   _broadcast/
     new/       messages sent to all agents
 ```
 
-A message is a JSON file: who sent it, what kind (note, correction, halt), how urgent, whether it sticks until acknowledged, and the body text.
+A message is a JSON file with sender, kind, priority, and body. Sending writes to `tmp`, syncs, renames. About 200 microseconds. That speed is irrelevant because delivery is gated by the subagent's tool call cadence, not the wire.
 
-Sending is a single function call. The Python library writes to `tmp`, syncs, renames into `new`. About 200 microseconds on an NVMe drive. That speed is irrelevant because delivery is gated by the subagent's tool call cadence, not by the wire. A subagent that runs a 30 second build will not see the message for 30 seconds regardless of transport latency.
-
-Delivery is the plugin. On every `tool.execute.after`, the plugin checks the subagent's `new/` directory. If there are messages, it atomically moves them to `cur/` and appends a formatted block to the tool output. The model sees it on its next reasoning step:
+Delivery is the plugin. On every `tool.execute.after`, the plugin checks the subagent's `new/` directory. Messages found are atomically moved to `cur/` and appended to the tool output:
 
 ```
 ⚠️ [SESSION-BUS] Messages:
   [cto→qa-agent]!! [correction]: Use bcrypt not sha256 for password hashing
 ```
 
-For pure reasoning turns where no tool fires, the `chat.system.transform` hook injects a standing directive into the system prompt. And for urgent cases where the agent is about to do something destructive, a `halt` message can reject the pending tool call entirely, replacing it with an error containing the correction.
+For reasoning turns with no tool call, `chat.system.transform` injects standing directives. For urgent cases, a `halt` message rejects the pending tool call and replaces it with an error containing the correction. Sticky messages persist until explicitly acknowledged.
 
-Sticky messages persist in `directives.json` until the agent explicitly acknowledges them. This prevents corrections from being forgotten across turns.
+## The registry
 
-## The Two-Phase Discovery
+Messaging requires knowing which sessions exist. Phase one was a passive registry: each session writes its state to a JSON file. Process ID, working directory, branch, locked files. Other sessions read it on startup.
 
-Cross-session messaging requires knowing which sessions exist. We built this in two phases.
+This found real bugs in its own implementation: shell injection in the CLI scripts, a cleanup routine that deleted live sessions, PID reuse after reboot. All fixed with atomic writes, input validation, and boot ID tracking.
 
-Phase one was the session registry. A passive, file-based directory where each session writes its state: process ID, working directory, Git branch, description, locked files. Other sessions read it on startup. No live messaging, just discovery and conflict detection. Sessions poll, they do not push.
+Phase two is the bus. Registry for discovery, bus for communication. Together they form a complete cross-session system with no daemons anywhere.
 
-This already caught real problems. Our QA agent found that the initial implementation had a shell injection vulnerability in the CLI scripts, a cleanup routine that deleted live sessions, and a PID reuse bug that would misidentify stale entries after a reboot. All fixed with atomic writes, input validation, and boot ID tracking.
+## What we tested
 
-Phase two is the bus described above. The registry handles discovery. The bus handles communication. Together they form a complete cross-session awareness system with zero daemons.
+Ten subagents dispatched in parallel. All returned. OpenCode has no concurrent subagent limit. DeepSeek V4 Flash permits 2,500 concurrent requests. The practical ceiling is context management, not infrastructure.
 
-## What We Tested
+A CTO directive sent to a test agent: "Run a council. Dispatch three subagents for database review, API analysis, and pipeline audit." The subagent read its inbox, parsed the directive, and asked if it should proceed.
 
-We dispatched 10 subagents in parallel. All returned. OpenCode has no limit on concurrent subagents beyond your API provider's rate limits. DeepSeek V4 Flash allows 2,500 concurrent requests. The practical ceiling is context management, not infrastructure.
+Crash recovery: kill a session mid-write and the temp file is orphaned but harmless. Kill it after write but before delivery and the message sits in `new/` waiting. Kill it after delivery but before ack and the message re-delivers on next poll. At-least-once semantics with message ID dedup handle all three.
 
-We sent a CTO directive to a test agent: "Run a council. Dispatch 3 subagents for database schema review, API rate limiting analysis, and deployment pipeline audit." The subagent read its inbox, parsed the directive, and asked if it should proceed.
+Cleanup: expired messages are garbage collected. Corrupt files are quarantined, not deleted. Broadcast messages fan out to all registered agents.
 
-We tested crash recovery. Kill a session mid-write. The temp file in `tmp/` is orphaned but harmless. Kill it after write but before delivery. The message sits in `new/`, waiting for the next reader. Kill it after delivery but before acknowledgement. The message is in `cur/` and will be redelivered on the next poll. The at-least-once semantics with message ID deduplication handle all three cases.
+## What this opens up
 
-We tested cleanup. Messages older than their TTL are garbage collected. Corrupt JSON files are quarantined, not deleted, preserving evidence for debugging. Broadcast messages fan out to all registered agents.
+The immediate use case is correcting a subagent mid-task. But the bus is general. A security auditor subagent can message the implementation subagent. A test runner can notify the deployer. The dashboard shows all active agents, their status, and pending messages.
 
-## What This Enables
+The injection model works for any hook. You could inject into the system prompt, modify tool arguments before execution, or export environment variables for shell attribution. The transport is decoupled from the injection mechanism.
 
-The immediate use case is the human operator correcting a subagent mid-task. But the bus is general. Agents can message each other. A security auditor subagent can send a finding to the implementation subagent. A test runner can notify the deployer that checks passed. The CTO dashboard can show all active agents, their status, and pending messages.
+## The code
 
-The plugin injection model works for any hook, not just `tool.execute.after`. You could inject context into the system prompt, modify tool arguments before execution, or export environment variables for shell attribution. The bus transport is decoupled from the injection mechanism, so you can add new delivery channels without changing the spool.
+This repository. About 300 lines of Python for the core, 100 lines of TypeScript for the plugin, 100 lines for the MCP server. Built from architecture to integration test in one afternoon.
 
-## The Code
-
-The code is in this repository. About 300 lines of Python for the core library, 100 lines of TypeScript for the plugin, and 100 lines of Python for the MCP server. Total build time from architecture to integration test: one afternoon.
+We opened a spec PR on OpenCode proposing that the `tool.execute.after` subagent behavior be documented and versioned so plugins can rely on it: [#41305](https://github.com/anomalyco/opencode/pull/41305). Two other contributors are already building session messaging transports. The hook contract is the missing piece.
 
 ## References
 
-The maildir specification was first described in Daniel J. Bernstein's qmail documentation (1997). The atomic rename guarantee comes from POSIX `rename(2)`. The plugin hook architecture is documented in OpenCode's plugin API (v1.18.15, 2026). Claude Code's agent teams feature was released in version 2.1.224 (July 2026) as part of their cross-session messaging system.
+Maildir: Daniel J. Bernstein, qmail (1997). Atomic rename: POSIX `rename(2)`. OpenCode plugin API: v1.18.15 (2026). Claude Code agent teams: v2.1.224 (July 2026).

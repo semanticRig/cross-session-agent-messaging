@@ -1,8 +1,14 @@
-# Cross-Session Agent Messaging
+# OpenCode Agent Teams — Now Possible
 
-Your OpenCode subagents are fire-and-forget. You dispatch them, they run, they report back. You cannot correct one mid-task without restarting it and losing context. This fixes that.
+Claude Code got agent teams in July 2026. You open two terminals, start two sessions, and they message each other. The lead can watch teammates in real time and send corrections mid-task. Pretty cool.
 
-A maildir spool and one plugin hook. No daemons, no sockets, no model cooperation needed. About 500 lines of code total.
+OpenCode had none of this. Subagents were fire-and-forget. No live messaging, no mid-task correction, no cross-session awareness.
+
+**Turns out the mechanism was hiding in plain sight.** One undocumented plugin hook. `tool.execute.after`. It fires for every subagent session and can mutate the output before the model reads it. That single hook, plus a maildir spool for crash-safe delivery, gives you the whole thing. About 500 lines of code. Zero daemons, zero sockets.
+
+## What's in here
+
+A working implementation. You clone this, drop two MCP servers into your OpenCode config, copy one plugin file, and you can correct subagents mid-task from another terminal. Same machine only for now. Files on disk, no server required.
 
 ## Architecture
 
@@ -16,32 +22,30 @@ flowchart LR
     BC --> SA
 ```
 
-A message is a JSON file. The operator writes it to the agent's maildir `new/` directory. The plugin hook (`tool.execute.after`) fires on every tool call, atomically moves the message to `cur/`, and appends it to the tool output. The language model sees it on its next turn.
+The operator drops a JSON message into the agent's maildir `new/` directory. The plugin hook grabs it on the next tool call, atomically moves it to `cur/`, and appends it to the tool output. The language model sees it next turn. No polling, no bash tools the model might skip. Deterministic.
 
-No polling. No bash tools that the model might skip. The hook fires deterministically.
-
-## What an agent sees
+## What the agent sees
 
 ```
 ⚠️ [SESSION-BUS] Messages:
   [cto→qa-agent]!! [correction]: Use bcrypt not sha256 for password hashing
 ```
 
-## The discovery
+## The discovery that makes this work
 
-OpenCode subagents share their parent's plugin hooks. `tool.execute.after` fires for every subagent session. It receives the session ID and the tool output text. It can mutate that output before the model reads it.
+Subagents are not separate processes. They are conversations inside the parent session. Because they share the parent's process, they also share its plugin hooks. `tool.execute.after` fires for subagents. It gets the session ID and tool output. It can change that output. The model never opted in.
 
-This was the missing piece. Earlier attempts assumed mid-turn injection was impossible in OpenCode. The mechanism was there the whole time.
+We tested this with a probe plugin. The hook fired. The subagent's transcript had our injected text. Deterministic, every time.
 
-## Try it
+## Get it running
 
-The code is in this repo. You need OpenCode 1.18+.
+Clone the repo. You need OpenCode 1.18 or newer.
 
 ```bash
 git clone https://github.com/semanticRig/cross-session-agent-messaging
 ```
 
-Add the MCP servers to your OpenCode config (`~/.config/opencode/opencode.jsonc`):
+Add these MCP servers to your OpenCode config:
 
 ```jsonc
 "mcp": {
@@ -58,23 +62,26 @@ Add the MCP servers to your OpenCode config (`~/.config/opencode/opencode.jsonc`
 }
 ```
 
-Restart OpenCode. The tools are available:
+For automatic injection, copy `plugins/session-bus.ts` to your OpenCode plugins directory. Restart. Then:
 
 ```
 bus_send("qa-agent", "check the login endpoint for SQL injection")
-bus_peers()     → lists agents with pending messages
-bus_inbox(...)  → reads and delivers messages
+bus_peers()     → see who has pending messages
+bus_inbox(...)  → read and deliver
 ```
 
-For automatic injection into subagent context, copy `plugins/session-bus.ts` to your OpenCode plugins directory.
+## Known limits
 
-## Where this breaks
+- The hook fires after a tool call. If the subagent finishes its turn with no tool call, the message lands on the next one.
+- At-least-once delivery. A crash between the rename into `new/` and the move to `cur/` can double-deliver. Message ID handles dedup.
+- Undocumented hook contract. `tool.execute.after`'s payload shape can change between OpenCode versions. Tested on 1.18.15. We opened a spec PR to stabilize this: [#41305](https://github.com/anomalyco/opencode/pull/41305).
+- Same machine only.
 
-Honest limitations, because claims without caveats read like hype:
+## Paper
 
-- The hook fires after a tool call. If the subagent emits a final answer with no further tool call, it will not see the message until the next tool turn.
-- Delivery is at-least-once. A crash between `rename` into `new/` and the move to `cur/` can double-deliver. Handle idempotency by message ID.
-- This builds on an undocumented hook contract. `tool.execute.after`'s payload shape can change between OpenCode versions. Tested against v1.18.15.
-- The bus is same-machine only. Messages are files on disk.
+Longer writeup with the full story: [paper.md](paper.md)
 
-## More detail
+## Related
+
+- OpenCode Issue: [#41304](https://github.com/anomalyco/opencode/issues/41304) — the discovery
+- OpenCode PR: [#41305](https://github.com/anomalyco/opencode/pull/41305) — spec for hook stabilization
