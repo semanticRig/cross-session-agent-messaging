@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""bus-peers — List agents with active inboxes."""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
+from bus import list_peers
+
+peers = list_peers()
+if peers:
+    for p in peers:
+        print(f"  {p['agent_id']}: pending={p['pending']} unacked={p['delivered_unacked']}")
+else:
+    print("No active peers.")

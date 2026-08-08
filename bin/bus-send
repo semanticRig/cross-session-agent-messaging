@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""bus-send — Send a message to an agent."""
+import argparse, json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
+from bus import send, list_peers
+
+p = argparse.ArgumentParser(description="Send a message on the session bus")
+p.add_argument("to", help="Agent ID or * for broadcast")
+p.add_argument("body", help="Message body")
+p.add_argument("--kind", default="note", choices=["note","correction","halt","request","reply"])
+p.add_argument("--priority", default="normal", choices=["normal","urgent","low"])
+p.add_argument("--sticky", action="store_true")
+p.add_argument("--from", dest="from_agent", default="cto")
+p.add_argument("--ttl", type=int, default=900)
+args = p.parse_args()
+
+mid = send(args.to, args.body, from_agent=args.from_agent, kind=args.kind,
+           priority=args.priority, sticky=args.sticky, ttl_seconds=args.ttl)
+print(json.dumps({"ok": True, "message_id": mid, "to": args.to}))
